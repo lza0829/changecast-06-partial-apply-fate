@@ -34,9 +34,60 @@ STREAM_SEEDS = [
     },
 ]
 
+SETTING_DEFAULTS = [
+    ("apply_order", "by_seq"),
+    ("duplicate_policy", "skip"),
+    ("tombstone_mode", "soft_delete"),
+    # 互斥部分失败结局：rollback / keep_prefix
+    ("partial_failure_policy", "rollback"),
+]
+
+# 批次结局列（旧库通过 ALTER TABLE 补齐）
+BATCH_EXTRA_COLUMNS = [
+    ("outcome_policy", "TEXT"),
+    ("success_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("failure_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("blocked_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("attempted_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("discarded_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("rolled_back", "INTEGER NOT NULL DEFAULT 0"),
+    ("fail_seq", "INTEGER"),
+    ("fail_event_id", "TEXT"),
+    ("watermark_before", "INTEGER NOT NULL DEFAULT 0"),
+    ("watermark_after", "INTEGER NOT NULL DEFAULT 0"),
+    ("error_message", "TEXT"),
+    ("projection_before_digest", "TEXT"),
+    ("projection_after_digest", "TEXT"),
+]
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _ensure_batch_columns(conn) -> set[str]:
+    """Return the set of columns that existed before migration (for backfill)."""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(project_batches)").fetchall()}
+    for name, decl in BATCH_EXTRA_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE project_batches ADD COLUMN {name} {decl}")
+    return existing
+
+
+def _backfill_old_batches(conn, existing: set[str]) -> None:
+    """Old completed batches predate the new columns; derive a coherent view."""
+    if "success_count" in existing:
+        return
+    conn.execute(
+        """
+        UPDATE project_batches
+        SET success_count = applied_upsert + applied_delete,
+            attempted_count = source_events,
+            watermark_after = max_seq,
+            outcome_policy = 'by_seq_full'
+        WHERE success_count = 0 AND status = 'completed'
+        """
+    )
 
 
 def init_db() -> None:
@@ -72,6 +123,20 @@ def init_db() -> None:
                 max_seq INTEGER NOT NULL,
                 note TEXT,
                 created_at TEXT NOT NULL,
+                outcome_policy TEXT,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                blocked_count INTEGER NOT NULL DEFAULT 0,
+                attempted_count INTEGER NOT NULL DEFAULT 0,
+                rolled_back INTEGER NOT NULL DEFAULT 0,
+                fail_seq INTEGER,
+                fail_event_id TEXT,
+                watermark_before INTEGER NOT NULL DEFAULT 0,
+                watermark_after INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                discarded_count INTEGER NOT NULL DEFAULT 0,
+                projection_before_digest TEXT,
+                projection_after_digest TEXT,
                 FOREIGN KEY(stream_id) REFERENCES project_streams(id)
             );
             CREATE TABLE IF NOT EXISTS projection_rows(
@@ -119,6 +184,9 @@ def init_db() -> None:
             );
             """
         )
+        existing_batch_columns = _ensure_batch_columns(conn)
+        _backfill_old_batches(conn, existing_batch_columns)
+
         if conn.execute("SELECT COUNT(*) c FROM project_streams").fetchone()["c"] == 0:
             now = _now()
             for s in STREAM_SEEDS:
@@ -141,18 +209,10 @@ def init_db() -> None:
                         now,
                     ),
                 )
-        if conn.execute("SELECT COUNT(*) c FROM settings").fetchone()["c"] == 0:
+        for key, value in SETTING_DEFAULTS:
             conn.execute(
-                "INSERT INTO settings(key, value) VALUES (?, ?)",
-                ("apply_order", "by_seq"),
-            )
-            conn.execute(
-                "INSERT INTO settings(key, value) VALUES (?, ?)",
-                ("duplicate_policy", "skip"),
-            )
-            conn.execute(
-                "INSERT INTO settings(key, value) VALUES (?, ?)",
-                ("tombstone_mode", "soft_delete"),
+                "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+                (key, value),
             )
         conn.commit()
     finally:

@@ -269,3 +269,36 @@ input:focus, select:focus, textarea:focus {
   .content { width: calc(100% - 1.25rem); }
   .nav a { padding: 0.32rem 0.5rem; font-size: 0.85rem; }
 }
+
+button.secondary {
+  background: #5f6b78;
+}
+button.secondary:hover { background: #3d4752; }
+
+.policy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  gap: 0.75rem;
+}
+
+.policy-card {
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-start;
+  padding: 0.85rem 0.95rem;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--line);
+  background: #fff;
+  cursor: pointer;
+}
+
+.policy-card.active {
+  border-left-color: var(--accent);
+  background: linear-gradient(180deg, #fff, #fdf1e9);
+}
+
+.policy-title {
+  font-family: "Fraunces", "Songti SC", serif;
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+}

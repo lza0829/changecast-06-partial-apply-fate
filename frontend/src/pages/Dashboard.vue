@@ -17,11 +17,17 @@ onMounted(async () => {
         <div class="stat"><div class="stat-num">{{ stats.stream_count }}</div><div class="stat-label">投影流</div></div>
         <div class="stat"><div class="stat-num">{{ stats.enabled_streams }}</div><div class="stat-label">已启用</div></div>
         <div class="stat"><div class="stat-num">{{ stats.batch_count }}</div><div class="stat-label">应用批次</div></div>
+        <div class="stat"><div class="stat-num">{{ stats.failed_batches }}</div><div class="stat-label">失败批次</div></div>
         <div class="stat"><div class="stat-num">{{ stats.projection_alive }}</div><div class="stat-label">存活投影</div></div>
         <div class="stat"><div class="stat-num">{{ stats.projection_deleted }}</div><div class="stat-label">已删投影</div></div>
         <div class="stat"><div class="stat-num">{{ stats.ooo_buffered }}</div><div class="stat-label">缓冲中</div></div>
       </div>
       <p style="margin-top:1rem">默认应用序 <span class="tag">{{ stats.apply_order }}</span>（按事件 seq 升序）</p>
+      <p>
+        部分失败结局
+        <span class="tag">{{ stats.partial_failure_policy === 'rollback' ? '整批回滚' : '保留连续前缀' }}</span>
+        · <router-link to="/settings">切换策略</router-link>
+      </p>
       <p><router-link to="/run">去投影台跑一趟 →</router-link></p>
     </div>
   </div>

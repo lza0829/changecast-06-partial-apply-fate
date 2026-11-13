@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -33,6 +34,40 @@ def replace_stream_projection(
         )
 
 
+def apply_event_to_projection(
+    conn: sqlite3.Connection,
+    *,
+    stream_id: int,
+    event: dict[str, Any],
+    updated_at: str,
+) -> None:
+    """Idempotent per-event write used by the keep_prefix fate."""
+    deleted = 1 if event["op"] == "delete" else 0
+    payload = None if deleted else json.dumps(event.get("payload") or {}, ensure_ascii=False)
+    conn.execute(
+        """
+        INSERT INTO projection_rows(
+            stream_id, entity_key, payload_json, applied_seq, applied_event_id, deleted, updated_at
+        ) VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(stream_id, entity_key) DO UPDATE SET
+            payload_json=excluded.payload_json,
+            applied_seq=excluded.applied_seq,
+            applied_event_id=excluded.applied_event_id,
+            deleted=excluded.deleted,
+            updated_at=excluded.updated_at
+        """,
+        (
+            stream_id,
+            event["entity_key"],
+            payload,
+            event["seq"],
+            event["event_id"],
+            deleted,
+            updated_at,
+        ),
+    )
+
+
 def list_projections(
     conn: sqlite3.Connection,
     *,
@@ -55,6 +90,48 @@ def list_projections(
         d["deleted"] = bool(d["deleted"])
         out.append(d)
     return out
+
+
+def projection_digest(conn: sqlite3.Connection, stream_id: int) -> str:
+    """Stable fingerprint of the persisted projection for a stream.
+
+    Used to prove that a rollback restored the projection to its pre-run state
+    byte-for-byte at the row level.
+    """
+    rows = conn.execute(
+        """
+        SELECT entity_key, payload_json, applied_seq, applied_event_id, deleted
+        FROM projection_rows WHERE stream_id=?
+        ORDER BY entity_key
+        """,
+        (stream_id,),
+    ).fetchall()
+    canonical = [
+        [r["entity_key"], r["payload_json"], r["applied_seq"], r["applied_event_id"], r["deleted"]]
+        for r in rows
+    ]
+    blob = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def projection_counts(conn: sqlite3.Connection, stream_id: int) -> dict[str, int]:
+    alive = conn.execute(
+        "SELECT COUNT(*) c FROM projection_rows WHERE stream_id=? AND deleted=0",
+        (stream_id,),
+    ).fetchone()["c"]
+    deleted = conn.execute(
+        "SELECT COUNT(*) c FROM projection_rows WHERE stream_id=? AND deleted=1",
+        (stream_id,),
+    ).fetchone()["c"]
+    return {"projected_alive": alive, "projected_deleted": deleted}
+
+
+def max_projected_seq(conn: sqlite3.Connection, stream_id: int) -> int:
+    r = conn.execute(
+        "SELECT MAX(applied_seq) m FROM projection_rows WHERE stream_id=?",
+        (stream_id,),
+    ).fetchone()
+    return int(r["m"] or 0)
 
 
 def list_known_event_ids(conn: sqlite3.Connection, stream_id: int) -> set[str]:

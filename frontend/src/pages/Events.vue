@@ -30,7 +30,7 @@ watch(batchId, async () => {
 <template>
   <div class="page">
     <h1>事件留痕</h1>
-    <p class="muted">本批（或全部）已处理事件：结果为写入 / 删除 / 跳过重复。</p>
+    <p class="muted">本批（或全部）已成功处理事件：结果为写入 / 删除 / 跳过重复。回滚策略下本批留痕为空。</p>
     <p v-if="err" class="tag danger">{{ err }}</p>
     <div class="panel" style="display:flex;gap:0.75rem;align-items:flex-end">
       <label>

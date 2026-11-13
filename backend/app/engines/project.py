@@ -1,95 +1,152 @@
-"""Apply CDC events onto an in-memory projection by seq order.
+"""Plan an incremental projection run over a contiguous seq prefix.
 
-Base behavior: sort by seq ascending; upsert/delete into projection;
-skip duplicate event_id. Out-of-order buffering is left for later topics.
+Two mutually exclusive partial-failure fates consume this plan:
+
+* ``rollback``   - all writes made by this run are undone with a SQLite
+  savepoint; the batch fails as a whole and the watermark stays put.
+* ``keep_prefix`` - only the contiguous run of successful seqs starting at
+  ``watermark + 1`` survives; the watermark advances to the end of that
+  prefix and the failed seq and everything after it are never marked
+  successful.
+
+The planner itself never touches storage: it walks candidate events in seq
+order, stops at the first failure or seq hole, and reports what happened.
+A seq hole is also terminal for the run: events beyond a gap cannot be
+committed because the stream's ordering contract is not satisfied.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 
-def apply_events(
-    events: list[dict[str, Any]],
-    *,
-    known_event_ids: set[str] | None = None,
-) -> dict[str, Any]:
-    known = set(known_event_ids or ())
-    projection: dict[str, dict[str, Any]] = {}
-    applied_log: list[dict[str, Any]] = []
-    counts = {
-        "source_events": len(events),
-        "applied_upsert": 0,
-        "applied_delete": 0,
-        "skipped_duplicate": 0,
-        "max_seq": 0,
+def _failure(ev: dict[str, Any], reason: str, message: str) -> dict[str, Any]:
+    return {
+        "seq": int(ev.get("seq", 0)),
+        "event_id": str(ev.get("event_id", "")),
+        "entity_key": str(ev.get("entity_key", "")),
+        "reason": reason,
+        "message": message,
     }
 
-    ordered = sorted(events, key=lambda e: (int(e.get("seq", 0)), str(e.get("event_id", ""))))
 
-    for ev in ordered:
-        event_id = str(ev["event_id"])
-        entity_key = str(ev["entity_key"])
-        op = str(ev.get("op", "upsert"))
+def plan_apply(
+    events: Iterable[dict[str, Any]],
+    *,
+    watermark: int,
+    fail_at_seq: int | None = None,
+    fail_event_id: str | None = None,
+    known_event_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Return the fate of every candidate event without writing anything.
+
+    Candidates must be events with ``seq > watermark``; any lower-seq event is
+    treated as stale and ignored before planning.
+    """
+    watermark = int(watermark)
+    known = set(known_event_ids or ())
+    candidates = sorted(
+        (dict(e) for e in events if int(e.get("seq", 0)) > watermark),
+        key=lambda e: (int(e.get("seq", 0)), str(e.get("event_id", ""))),
+    )
+
+    expected_seq = watermark + 1
+    successes: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    failure: dict[str, Any] | None = None
+    terminal_reason: str | None = None
+
+    for idx, ev in enumerate(candidates):
         seq = int(ev.get("seq", 0))
-        event_time = str(ev.get("event_time", ""))
-        counts["max_seq"] = max(counts["max_seq"], seq)
+        event_id = str(ev.get("event_id", ""))
+        entity_key = str(ev.get("entity_key", ""))
+        op = str(ev.get("op", "upsert"))
 
-        if event_id in known:
-            counts["skipped_duplicate"] += 1
-            applied_log.append(
-                {
-                    "event_id": event_id,
-                    "entity_key": entity_key,
-                    "op": op,
-                    "seq": seq,
-                    "event_time": event_time,
-                    "result": "skipped_duplicate",
-                    "payload": ev.get("payload"),
-                }
-            )
-            continue
+        if seq != expected_seq:
+            # A hole in seq ordering. Never skip over it: everything from
+            # here on stays unapplied, even if the fixture carries higher seqs.
+            terminal_reason = "gap"
+            blocked = candidates[idx:]
+            break
 
-        known.add(event_id)
-        if op == "delete":
-            projection[entity_key] = {
-                "entity_key": entity_key,
-                "payload": None,
-                "applied_seq": seq,
-                "applied_event_id": event_id,
-                "deleted": True,
-            }
-            counts["applied_delete"] += 1
-            result = "applied_delete"
-        else:
-            projection[entity_key] = {
-                "entity_key": entity_key,
-                "payload": ev.get("payload") or {},
-                "applied_seq": seq,
-                "applied_event_id": event_id,
-                "deleted": False,
-            }
-            counts["applied_upsert"] += 1
-            result = "applied_upsert"
+        if fail_at_seq is not None and seq == fail_at_seq:
+            failure = _failure(ev, "injected_failure", f"注入失败：seq {seq} 按请求失败")
+            terminal_reason = "injected_failure"
+            blocked = candidates[idx + 1 :]
+            break
+        if fail_event_id is not None and event_id == fail_event_id:
+            failure = _failure(ev, "injected_failure", f"注入失败：事件 {event_id} 按请求失败")
+            terminal_reason = "injected_failure"
+            blocked = candidates[idx + 1 :]
+            break
 
-        applied_log.append(
+        if op not in ("upsert", "delete"):
+            failure = _failure(ev, "invalid_op", f"不支持的操作 {op!r}")
+            terminal_reason = "invalid_op"
+            blocked = candidates[idx + 1 :]
+            break
+        if not entity_key:
+            failure = _failure(ev, "invalid_entity_key", "事件缺少实体键")
+            terminal_reason = "invalid_entity_key"
+            blocked = candidates[idx + 1 :]
+            break
+        if op == "upsert" and ev.get("payload") is not None and not isinstance(ev["payload"], dict):
+            failure = _failure(ev, "invalid_payload", "upsert 载荷必须是对象")
+            terminal_reason = "invalid_payload"
+            blocked = candidates[idx + 1 :]
+            break
+
+        duplicate = event_id in known
+        if not duplicate:
+            known.add(event_id)
+        successes.append(
             {
+                "seq": seq,
                 "event_id": event_id,
                 "entity_key": entity_key,
                 "op": op,
-                "seq": seq,
-                "event_time": event_time,
-                "result": result,
+                "event_time": str(ev.get("event_time", "")),
                 "payload": ev.get("payload"),
+                "duplicate": duplicate,
+                "result": (
+                    "skipped_duplicate"
+                    if duplicate
+                    else ("applied_delete" if op == "delete" else "applied_upsert")
+                ),
             }
         )
+        expected_seq = seq + 1
 
-    alive = [r for r in projection.values() if not r["deleted"]]
-    deleted = [r for r in projection.values() if r["deleted"]]
-    counts["projected_alive"] = len(alive)
-    counts["projected_deleted"] = len(deleted)
+    resulting_watermark = expected_seq - 1
+    applied_upsert = sum(1 for s in successes if s["result"] == "applied_upsert")
+    applied_delete = sum(1 for s in successes if s["result"] == "applied_delete")
+    skipped_duplicate = sum(1 for s in successes if s["result"] == "skipped_duplicate")
+    attempted = len(successes) + (1 if failure else 0)
+
     return {
-        "counts": counts,
-        "projection": list(projection.values()),
-        "applied_log": applied_log,
+        "successes": successes,
+        "failure": failure,
+        "blocked": [
+            {
+                "seq": int(e.get("seq", 0)),
+                "event_id": str(e.get("event_id", "")),
+                "entity_key": str(e.get("entity_key", "")),
+                "op": str(e.get("op", "upsert")),
+                "event_time": str(e.get("event_time", "")),
+            }
+            for e in blocked
+        ],
+        "terminal_reason": terminal_reason,
+        "source_events": len(candidates),
+        "success_count": len(successes),
+        "failure_count": 1 if failure else 0,
+        "blocked_count": len(blocked),
+        "attempted_count": attempted,
+        "applied_upsert": applied_upsert,
+        "applied_delete": applied_delete,
+        "skipped_duplicate": skipped_duplicate,
+        "surviving_watermark": resulting_watermark,
+        "max_seq": max((int(e.get("seq", 0)) for e in candidates), default=watermark),
+        "max_success_seq": successes[-1]["seq"] if successes else watermark,
+        "fail_seq": failure["seq"] if failure else (blocked[0]["seq"] if blocked else None),
     }

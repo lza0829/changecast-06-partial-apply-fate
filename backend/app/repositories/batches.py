@@ -4,40 +4,57 @@ from typing import Any
 
 import sqlite3
 
+BATCH_FIELDS = (
+    "batch_no",
+    "stream_id",
+    "status",
+    "source_events",
+    "applied_upsert",
+    "applied_delete",
+    "skipped_duplicate",
+    "projected_alive",
+    "projected_deleted",
+    "max_seq",
+    "note",
+    "created_at",
+    "outcome_policy",
+    "success_count",
+    "failure_count",
+    "blocked_count",
+    "attempted_count",
+    "discarded_count",
+    "rolled_back",
+    "fail_seq",
+    "fail_event_id",
+    "watermark_before",
+    "watermark_after",
+    "error_message",
+    "projection_before_digest",
+    "projection_after_digest",
+)
+
 
 def insert_batch(
     conn: sqlite3.Connection,
     *,
-    batch_no: str,
-    stream_id: int,
-    status: str,
-    counts: dict[str, int],
-    note: str | None,
-    created_at: str,
+    metrics: dict[str, Any],
 ) -> int:
+    values = [metrics.get(f) for f in BATCH_FIELDS]
+    placeholders = ",".join("?" for _ in BATCH_FIELDS)
     cur = conn.execute(
-        """
-        INSERT INTO project_batches(
-            batch_no, stream_id, status, source_events, applied_upsert, applied_delete,
-            skipped_duplicate, projected_alive, projected_deleted, max_seq, note, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            batch_no,
-            stream_id,
-            status,
-            counts["source_events"],
-            counts["applied_upsert"],
-            counts["applied_delete"],
-            counts["skipped_duplicate"],
-            counts["projected_alive"],
-            counts["projected_deleted"],
-            counts["max_seq"],
-            note,
-            created_at,
-        ),
+        f"INSERT INTO project_batches({','.join(BATCH_FIELDS)}) VALUES ({placeholders})",
+        values,
     )
     return int(cur.lastrowid)
+
+
+def update_batch(conn: sqlite3.Connection, batch_id: int, metrics: dict[str, Any]) -> None:
+    fields = [f for f in BATCH_FIELDS if f in metrics]
+    assignments = ",".join(f"{f}=?" for f in fields)
+    conn.execute(
+        f"UPDATE project_batches SET {assignments} WHERE id=?",
+        [metrics[f] for f in fields] + [batch_id],
+    )
 
 
 def list_batches(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
@@ -96,6 +113,14 @@ def list_applied_events(
     if stream_id is not None:
         sql += " AND stream_id=?"
         params.append(stream_id)
-    sql += " ORDER BY id DESC LIMIT ?"
+    sql += " ORDER BY seq ASC, id ASC LIMIT ?"
     params.append(limit)
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def count_results(conn: sqlite3.Connection, batch_id: int) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT result, COUNT(*) c FROM applied_events WHERE batch_id=? GROUP BY result",
+        (batch_id,),
+    ).fetchall()
+    return {r["result"]: r["c"] for r in rows}

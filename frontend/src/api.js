@@ -4,9 +4,9 @@ export async function getJSON(url) {
   return r.json()
 }
 
-export async function postJSON(url, body = {}) {
+export async function postJSON(url, body = {}, method = 'POST') {
   const r = await fetch(url, {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
